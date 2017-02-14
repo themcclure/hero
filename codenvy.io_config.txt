@@ -1,0 +1,31 @@
+Configure Workspace:
+- Create new workspace
+- Select python-gae stack
+- Open workspace
+
+Install SDK from terminal:
+export CLOUD_SDK_REPO="cloud-sdk-$(lsb_release -c -s)"
+echo "deb https://packages.cloud.google.com/apt $CLOUD_SDK_REPO main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+sudo apt-get update
+sudo apt-get install google-cloud-sdk
+sudo apt-get install google-cloud-sdk-app-engine-python
+
+gcloud init
+
+**Project**
+CD to the project directory
+
+
+Environment
+virtualenv env
+source env/bin/activate
+pip install -t lib -r requirements.txt
+
+
+Sample Code
+cd ~
+git clone https://github.com/GoogleCloudPlatform/python-docs-samples.git
+
+Testing
+sudo apt-get install lynx
