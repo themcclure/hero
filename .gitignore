@@ -90,3 +90,9 @@ env/
 
 # Rope project settings
 .ropeproject
+
+# IDE
+.idea
+
+# Credential data
+/load_db/creds.data

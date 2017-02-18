@@ -42,19 +42,19 @@ list_of_urls = [
 "https://docs.google.com/spreadsheets/d/1zJv0FYxoiC7YwgqIHmIsN_0h1UGkATi55hNDhM8WiSc/edit#gid=1988016352",
 "https://docs.google.com/spreadsheets/d/1kG9QTdus7LbpZP-3L9fNvwQ0nVpUUXyw7m7hpKSBH-E/edit#gid=2008460745",
 "http://goo.gl/iR9kn2",
-########
 ]
+########
 
 ########
 # initialize config items
 #
-# reload only if the last_load time is older than the stale time 
+# configure stale_time to determine if the history doc needs to be reloaded
 SECONDS = 1
 MINUTES = 60*SECONDS
 HOURS = 60*MINUTES
 DAYS = 24*HOURS
-stale_time = time.time() - 5*MINUTES
-stale_time = time.time() - 30*SECONDS
+stale_time = time.time() - 2*MINUTES
+#stale_time = time.time() - 5*DAYS
 ########
 
 # utility function to unshorten URLs
