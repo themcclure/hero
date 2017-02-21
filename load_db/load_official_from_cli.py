@@ -1,7 +1,8 @@
 from oauth2client.client import OAuth2WebServerFlow
 from oauth2client.tools import run_flow
 from oauth2client.file import Storage
-from tinydb import TinyDB, Query
+import validators
+import couchdb
 import gspread
 import time
 import requests
@@ -119,30 +120,35 @@ SECONDS = 1
 MINUTES = 60*SECONDS
 HOURS = 60*MINUTES
 DAYS = 24*HOURS
-stale_time = time.time() - 2*MINUTES
-# stale_time = time.time() - 5*DAYS
+# stale_time = time.time() - 2*MINUTES
+stale_time = time.time() - 5*DAYS
 ####################
 
 
 ####################
 # Utility functions (to be moved out to another file)
 ####################
-# utility function to unshorten URLs
 def unshorten_url(url):
     '''
-    Takes a URL, opens it in a web stream, and returns the eventual destination
+    Takes a URL and unshortens it so it can be used by the Google API.
+    The URL is opened in a web stream, and returns the eventual destination URL
     :param url: the URL (short or otherwise)
-    :return: the destination URL
+    :return: the destination URL, or None if it's an invalid URL
     '''
-    return requests.head(url, allow_redirects=True).url
+    try:
+        r = requests.head(url, allow_redirects=True).url
+    except requests.ConnectionError as e:
+        return "error {}".format(str(e))
+    return r
 ####################
 
 
 ####################
 # Initialize datastores
-offdb = TinyDB('officials_db.json')
-OffQuery = Query()
-# TODO: add in aliases db to track alternative names for finding them later
+# couch = couchdb.Server('http://10.0.1.61:5984') # docker image on the great machine
+couch = couchdb.Server('http://hero:hero@themcclure.synology.me:59841') # docker image on the great machine
+offdb = couch['hero']
+# TODO: add in officials-aliases db to track alternative names for finding them later
 # TODO: add in metadata db to provide lookups
 ####################
 
@@ -210,10 +216,10 @@ def normalize_cert_endorsements(cert_string):
     cert_string = get_value(cert_string)
     if cert_string is None:
         return None
-    # TODO catalog the list of the past endorsement options
+    # TODO catalog the list of the past endorsement options, possibly having to resort to regex
 
     # at the moment, just return a list of the raw strings
-    return cert_string.split()
+    return map(lambda x: get_value(x), cert_string.split())
 
 
 def normalize_cert_value(cert_string):
@@ -300,6 +306,8 @@ def process_games(history):
             continue
 
         game = dict()
+        game['tab'] = source
+
         val = get_value(row[0])
         if val:
             game['date'] = val
@@ -359,10 +367,11 @@ def process_games(history):
         games.append(game)
     return games
 
+
 def load_from_sheets(gconn, offdb, url):
     """
     This function takes a Google Sheets URL and using the API, parses it and returns a dict structure
-    that represents the information taken from the sheet in a format suitable for loading into the tinydb (JSON).
+    that represents the information taken from the sheet in a format suitable for loading into the couchdb (JSON).
     Currently supporting history docs version: 2.x (only)
     :param gconn: the connection to the Google Sheets API
     :param offdb: the Officials database
@@ -371,10 +380,12 @@ def load_from_sheets(gconn, offdb, url):
     """
     # open a new Google Sheet
     url = unshorten_url(url)
+    if not validators.url(url):
+        return False, url
     try:
         sheet = gconn.open_by_url(url)
-    except gspread.SpreadsheetNotFound:
-        return False, "Can't find a spreadsheet there - might be v1 or not a Sheets URL"
+    except gspread.SpreadsheetNotFound as e:
+        return False, "Can't find a spreadsheet there - might be v1 or not a Sheets URL: {}".format(url)
     except Exception as e:
         return False, "Something went wrong trying to open the URL: {}".format(str(e))
 
@@ -392,30 +403,35 @@ def load_from_sheets(gconn, offdb, url):
     id = sheet.id
 
     # does the official exist in the offdb already?
-    # remove the entry first, to be replaced with the updated one
-    # maybe one day there will be a historical track of the snapshots
-    q = offdb.search(OffQuery.id == id)
-    if len(q) > 0:
-        print "Found existing entry for: " + q[0]['name']
-        # print "last updated at: " + time.ctime(q[0]['last_updated'])
-    
-        # if they exist and the information is "fresh" then move along
-        if q[0]['last_updated'] > stale_time:
-            print "They're delightfully fresh, moving on..."
-            return False, "{} is still current in db".format(q[0]['name'])
+    if id in offdb:
+        # print "Found existing entry for: " + offdb[id]['name']
+
+        # if they exist and the force_refresh flag is not set and the information is "fresh" then skip them
+        if ('force_refresh' in offdb[id]) and (offdb[id]['force_refresh']):
+            print "Forcing refresh of {}, per db flag".format(offdb[id]['name'])
+        elif offdb[id]['last_updated'] > stale_time:
+            # print "They're delightfully fresh, moving on..."
+            # return False, "{} is still current in offdb".format(offdb[id]['name'])
+            return False, None
         else:
-            print "They're a bit on the nose, getting a new copy..."
-            offdb.remove((OffQuery.id == id))
+            # print "They're a bit on the nose, getting a new copy..."
+            pass
 
     # basic info
     summary = sheet.worksheet("Summary")
     name = get_name(sheet)
-    print "Loading: " + name
+    # print "Loading: " + name
     off = dict()
-    off['id'] = id
+    off['_id'] = id
+    # if the entry is in the db already, add in the revision number for db referential integrity
+    # this will only cause a problem if two people are updating the same record concurrently
+    if id in offdb:
+        off['_rev'] = offdb[id]['_rev']
+    off['url'] = url
     off['name'] = name
     off['template_version'] = 2
     off['last_updated'] = time.time()
+    off['force_refresh'] = 0
 
     off['league'] = get_value(summary.acell('C5').value)
     # TODO find a way to map league to location
@@ -448,11 +464,16 @@ def load_from_sheets(gconn, offdb, url):
         off['insurance']['number'] = get_value(summary.acell('C6').value)
         off['insurance']['provider'] = get_value(summary.acell('H6').value)
 
-    # game information
-    # TODO process the "Other" tab
+    # game information from the main "Game History"
     games = process_games(sheet.worksheet("Game History"))
     if games:
         off['games'] = games
+        pass
+    # process the "Other History" tab
+    if "Other History" in map(lambda x: x.title, sheet.worksheets()):
+        games = process_games(sheet.worksheet("Other History"))
+        if games:
+            off['games'] += games
 
     return True, off
 ####################
@@ -461,15 +482,68 @@ def load_from_sheets(gconn, offdb, url):
 ####################
 # Start the meat of the loading work
 ####################
-start_run_time = time.time()
-# Open authenticated connection to the Google Sheets API
-gconn = gspread.authorize(credentials)
+def process_list(urls):
+    """
+    Iterate through the list of URLs provided
+    :param urls: list of URLs
+    """
+    start_run_time = time.time()
+    # Open authenticated connection to the Google Sheets API
+    gconn = gspread.authorize(credentials)
 
-# for each history doc, try to load it in the database
-for url in list_of_urls:
-    loaded_correctly, off = load_from_sheets(gconn, offdb, url)
-    if loaded_correctly:
-        offdb.insert(off)
+    # for each history doc, try to load it in the database
+    for url in urls:
+        loaded_correctly, off = load_from_sheets(gconn, offdb, url)
+        if loaded_correctly:
+            offdb.save(off)
+        # this is an elif rather than an else, to suppress blank messages (for the "fresh" entries)
+        elif off:
+            print "URL {} was not loaded because: {}".format(url, off)
+    print "Total time {:.2f}s (with an init time of {:.2f}s)".format((time.time() - start_init_time), (start_run_time - start_init_time))
+
+
+def get_urls_from_sheet(sheet, tabname, column, num_header_rows=1):
+    """
+    Get a list of URLs from a google sheet, in the named tab and the nominated column
+    :param sheet: URL of a google sheet (typically an application form)
+    :param tabname: name of the tab to look in
+    :param column: the column that has the URLs in it
+    :param num_header_rows: the number of header rows to skip
+    :return: a list of URLs
+    """
+    start_run_time = time.time()
+    # Open authenticated connection to the Google Sheets API
+    gconn = gspread.authorize(credentials)
+    # open a new Google Sheet
+    sheet = unshorten_url(sheet)
+    try:
+        sheet = gconn.open_by_url(sheet)
+    except gspread.SpreadsheetNotFound:
+        return "Can't find a spreadsheet there - might be v1 or not a Sheets URL"
+    except Exception as e:
+        return "Something went wrong trying to open the URL: {}".format(str(e))
+
+    url_list = list()
+    if tabname in map(lambda x: x.title, sheet.worksheets()):
+        list_sheet = sheet.worksheet(tabname)
+        rows = list_sheet.get_all_values()
+        for row in rows[num_header_rows:]:
+            url_list.append(row[column])
     else:
-        print "URL {} was not loaded because: {}".format(url, off)
-print "Total time {:.2f}s (with an init time of {:.2f}s)".format((time.time() - start_init_time), (start_run_time - start_init_time))
+        print "Tab {} not found!".format(tabname)
+    print "Time to load list of URLs {:.2f}s".format((time.time() - start_run_time))
+    return url_list
+
+
+# if run from the command line, go through the test list of URLs
+if __name__ == '__main__':
+    urls = [
+        'https://docs.google.com/spreadsheets/d/1rdg4dFQqacl48rokjy9s2gP_EQ_AELM9eRa2SS9skIU/edit?usp=sharing',
+        'http://goo.gl/M2tQ3',
+    ]
+    urls = get_urls_from_sheet('https://docs.google.com/spreadsheets/d/1qTFa3wzi-3HJ_5JGtr12cZiQ6K9U9pWL9UI8TDo0fUU/edit#gid=1023242182','Form Responses 1', 5)
+    if isinstance(urls, list):
+        process_list(urls)
+    else:
+        print urls
+        process_list(list_of_urls)
