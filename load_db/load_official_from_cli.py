@@ -58,6 +58,8 @@ blank_entries = [
     None,
     '',
     '-',
+    '--',
+    '---',
     'N/A',
     'N/a',
     'n/a',
@@ -120,8 +122,8 @@ SECONDS = 1
 MINUTES = 60*SECONDS
 HOURS = 60*MINUTES
 DAYS = 24*HOURS
-# stale_time = time.time() - 2*MINUTES
-stale_time = time.time() - 5*DAYS
+stale_time = time.time() - 10*DAYS
+stale_time = time.time() - 2*DAYS # short (debug) time
 ####################
 
 
@@ -146,7 +148,8 @@ def unshorten_url(url):
 ####################
 # Initialize datastores
 # couch = couchdb.Server('http://10.0.1.61:5984') # docker image on the great machine
-couch = couchdb.Server('http://hero:hero@themcclure.synology.me:59841') # docker image on the great machine
+# couch = couchdb.Server('http://hero:hero@themcclure.synology.me:59841') # docker image on the great machine
+couch = couchdb.Server('http://hero:hero@themcclure.synology.me:59841') # replicated local image
 offdb = couch['hero']
 # TODO: add in officials-aliases db to track alternative names for finding them later
 # TODO: add in metadata db to provide lookups
@@ -205,16 +208,21 @@ def get_name(sheet):
     return name
 
 
-def normalize_cert_endorsements(cert_string):
+def normalize_cert_endorsements(refcert_string, nsocert_string):
     """
     Takes the string from the cert endorsement cells and returns a list of standard endorsements, plus the strings that
     were not recognized
-    :param cert_string: the raw string from the endorsement cells
+    :param refcert_string: the raw ref string from the endorsement cells
+    :param nsocert_string: the raw NSO string from the endorsement cells
     :return: list of recognized endorsements, plus a split of the remaining entries
     """
     # If there's nothing in the string, return None
-    cert_string = get_value(cert_string)
-    if cert_string is None:
+    cert_string = ""
+    if refcert_string:
+        cert_string += refcert_string
+    if nsocert_string:
+        cert_string += nsocert_string
+    if not cert_string:
         return None
     # TODO catalog the list of the past endorsement options, possibly having to resort to regex
 
@@ -269,6 +277,10 @@ def get_value(value, datatype=None, enum=None):
     :param enum: a list containing valid values
     :return: interpreted value, as a string (by default) or datatype if listed
     """
+
+    # get rid of trailing/leading spaces
+    value = value.strip()
+
     # if the passed in value is blank, return None
     if value in blank_entries:
         return None
@@ -404,11 +416,11 @@ def load_from_sheets(gconn, offdb, url):
 
     # does the official exist in the offdb already?
     if id in offdb:
-        # print "Found existing entry for: " + offdb[id]['name']
+        # print u"Found existing entry for: " + offdb[id]['name']
 
         # if they exist and the force_refresh flag is not set and the information is "fresh" then skip them
         if ('force_refresh' in offdb[id]) and (offdb[id]['force_refresh']):
-            print "Forcing refresh of {}, per db flag".format(offdb[id]['name'])
+            print u"Forcing refresh of {}, per db flag".format(offdb[id]['name'])
         elif offdb[id]['last_updated'] > stale_time:
             # print "They're delightfully fresh, moving on..."
             # return False, "{} is still current in offdb".format(offdb[id]['name'])
@@ -420,7 +432,7 @@ def load_from_sheets(gconn, offdb, url):
     # basic info
     summary = sheet.worksheet("Summary")
     name = get_name(sheet)
-    # print "Loading: " + name
+    print u"Loading: " + name
     off = dict()
     off['_id'] = id
     # if the entry is in the db already, add in the revision number for db referential integrity
@@ -428,12 +440,13 @@ def load_from_sheets(gconn, offdb, url):
     if id in offdb:
         off['_rev'] = offdb[id]['_rev']
     off['url'] = url
-    off['name'] = name
+    off['name'] = unicode(name)
     off['template_version'] = 2
     off['last_updated'] = time.time()
+    off['last_updated_readable'] = time.ctime()
     off['force_refresh'] = 0
 
-    off['league'] = get_value(summary.acell('C5').value)
+    off['league'] = unicode(get_value(summary.acell('C5').value))
     # TODO find a way to map league to location
     # off['location'] = ""
     # officiating since: currently free text for whatever they put in the cell
@@ -452,7 +465,7 @@ def load_from_sheets(gconn, offdb, url):
             off['cert']['ref_level'] = ref_level
         if nso_level:
             off['cert']['nso_level'] = nso_level
-        cert_endorsements = normalize_cert_endorsements(summary.acell('G7').value + ' ' + summary.acell('G8').value)
+        cert_endorsements = normalize_cert_endorsements(get_value(summary.acell('G7').value), get_value(summary.acell('G8').value))
         if cert_endorsements:
             off['cert']['cert_endorsements'] = cert_endorsements
 
@@ -462,13 +475,13 @@ def load_from_sheets(gconn, offdb, url):
     if number or provider:
         off['insurance'] = dict()
         off['insurance']['number'] = get_value(summary.acell('C6').value)
-        off['insurance']['provider'] = get_value(summary.acell('H6').value)
+        off['insurance']['provider'] = unicode(get_value(summary.acell('H6').value))
 
     # game information from the main "Game History"
     games = process_games(sheet.worksheet("Game History"))
     if games:
         off['games'] = games
-        pass
+
     # process the "Other History" tab
     if "Other History" in map(lambda x: x.title, sheet.worksheets()):
         games = process_games(sheet.worksheet("Other History"))
@@ -492,14 +505,19 @@ def process_list(urls):
     gconn = gspread.authorize(credentials)
 
     # for each history doc, try to load it in the database
+    print u"Attempting to load {} URLs".format(len(urls))
+    failures = 0
     for url in urls:
+        # print u"attempting {}".format(url)
         loaded_correctly, off = load_from_sheets(gconn, offdb, url)
         if loaded_correctly:
+            print u"Processed {}".format(off['name'])
             offdb.save(off)
         # this is an elif rather than an else, to suppress blank messages (for the "fresh" entries)
         elif off:
-            print "URL {} was not loaded because: {}".format(url, off)
-    print "Total time {:.2f}s (with an init time of {:.2f}s)".format((time.time() - start_init_time), (start_run_time - start_init_time))
+            print u"URL {} was not loaded because: {}".format(url, off)
+            failures += 1
+    print u"Total time {:.2f}s (with an init time of {:.2f}s) and {} failures ({:.1f}%)".format((time.time() - start_init_time), (start_run_time - start_init_time), failures, (failures * 100.0 / len(urls)))
 
 
 def get_urls_from_sheet(sheet, tabname, column, num_header_rows=1):
@@ -530,20 +548,61 @@ def get_urls_from_sheet(sheet, tabname, column, num_header_rows=1):
         for row in rows[num_header_rows:]:
             url_list.append(row[column])
     else:
-        print "Tab {} not found!".format(tabname)
-    print "Time to load list of URLs {:.2f}s".format((time.time() - start_run_time))
+        print u"Tab {} not found!".format(tabname)
+    print u"Time to load list of URLs {:.2f}s".format((time.time() - start_run_time))
     return url_list
+
+
+def get_stale_urls():
+    """
+    Query the database for entries that are deemed "stale" and return their URLs for reloading
+    :return: list of URLs
+    """
+    urls = list()
+    docquery = offdb.view('force_refresh/last_updated')
+    for row in docquery[:stale_time]:
+        urls.append(row['value'][2])
+    return urls
 
 
 # if run from the command line, go through the test list of URLs
 if __name__ == '__main__':
-    urls = [
-        'https://docs.google.com/spreadsheets/d/1rdg4dFQqacl48rokjy9s2gP_EQ_AELM9eRa2SS9skIU/edit?usp=sharing',
-        'http://goo.gl/M2tQ3',
-    ]
-    urls = get_urls_from_sheet('https://docs.google.com/spreadsheets/d/1qTFa3wzi-3HJ_5JGtr12cZiQ6K9U9pWL9UI8TDo0fUU/edit#gid=1023242182','Form Responses 1', 5)
-    if isinstance(urls, list):
-        process_list(urls)
+    # this variable controls which source will be used to load,
+    # 'stale': stale db entries
+    # tournament short name: named application form
+    # anything else: test url list
+    source = 'playoffs2016'
+    if source == 'stale':
+        urls = get_stale_urls()
+        print u'stale urls: {}'.format(len(get_stale_urls()))
+    elif source == 'cc':
+        # clover cup
+        sheet_url = 'https://docs.google.com/spreadsheets/d/1qTFa3wzi-3HJ_5JGtr12cZiQ6K9U9pWL9UI8TDo0fUU/edit#gid=1023242182'
+        urls = get_urls_from_sheet(sheet_url, 'Form Responses 1', 5)
+    elif source == 'playoffs2016':
+        # playoffs 2016
+        sheet_url = 'https://docs.google.com/spreadsheets/d/1hXwxFjFFFiGsDXpnSj2WW6Fls1pqJ9XOFMGOZDy_9FE/edit#gid=848540806'
+        # THR tab
+        urls = get_urls_from_sheet(sheet_url, 'THR Applicants', 11)
+        # THNSO tab
+        urls += get_urls_from_sheet(sheet_url, 'THNSO Applicants', 10)
+        # Ref tab
+        urls += get_urls_from_sheet(sheet_url, 'SO Applicants', 11)
+        # NSO tab
+        urls += get_urls_from_sheet(sheet_url, 'NSO Applicants', 10)
+        # remove the ducplicate entries
+        urls = list(set(urls))
     else:
-        print urls
-        process_list(list_of_urls)
+        urls = [
+            'https://docs.google.com/spreadsheets/d/1rdg4dFQqacl48rokjy9s2gP_EQ_AELM9eRa2SS9skIU/edit?usp=sharing',
+            'http://goo.gl/M2tQ3',
+        ]
+
+    process_list(urls)
+
+    # test fragment to demonstrate a view query for how many stale URLs there are in the DB:
+    docquery = offdb.view('force_refresh/last_updated')
+    two_hours_stale = docquery[:(time.time() - 2*HOURS)].rows
+    two_days_stale = docquery[:(time.time() - 2*DAYS)].rows
+    print u"total number = {}\n2 hours (test) stale {}\n2 days (fully) stale {}".format(docquery.total_rows,
+                            len(two_hours_stale), len(two_days_stale))
