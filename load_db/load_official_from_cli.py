@@ -5,36 +5,13 @@ import validators
 import couchdb
 import gspread
 import time
+import datetime
 import requests
 import re
 import httplib
 import urlparse
-
-####################
-# Initialize authentication with Google
-CLIENT_ID = '48539282111-07fidfl1225gaiqk49ubb6r1fr21npln.apps.googleusercontent.com'
-CLIENT_SECRET = 'CQ6-3PPwUjB6nZeYujAuqcWo'
-# Set scope of permissions to accessing spreadsheets
-scope = ['https://spreadsheets.google.com/feeds', 'https://docs.google.com/feeds']
-redirect_uri = 'http://localhost:8080'
-
-# Initialize the "flow" of the Google OAuth2.0 end user credentials
-start_init_time = time.time()
-flow = OAuth2WebServerFlow(client_id=CLIENT_ID,
-                           client_secret=CLIENT_SECRET,
-                           scope=scope,
-                           redirect_uri=redirect_uri)
-
-# store the credential, so you don't keep bugging the user
-storage = Storage('creds.data')
-
-# Authenticate end user from file first, if the credentials are valid
-# NOTE: Flows don't seem to return a refresh token, so when the access
-# token expires, you have to invoke user interaction
-credentials = storage.get()
-if not credentials or credentials.invalid or credentials.access_token_expired:
-    credentials = run_flow(flow, storage)
-####################
+# ugly workarounds
+import webbrowser
 
 
 ####################
@@ -52,10 +29,13 @@ blank_entries = [
     '-',
     '--',
     '---',
+    'NA',
+    'na',
     'N/A',
     'N/a',
     'n/a',
     'None',
+    'none',
 ]
 # which Last Revised dates are known to be Template v2.x revision dates
 known_v2_revisions = [
@@ -64,6 +44,7 @@ known_v2_revisions = [
     'Last Revised 2017-01-05',
 ]
 # known Associations
+# TODO: when does JRDA become a viable association?
 known_associations = [
     'WFTDA',
     'MRDA',
@@ -102,22 +83,111 @@ nso_roles = [
     'ALTN'
 ]
 known_roles = ref_roles + nso_roles
+known_roles2 = dict()
+known_roles2['JR'] = {'order': 'Referee', 'family': 'JR', 'name': 'Jammer Referee', 'active': 'true'}
+known_roles2['CHNSO'] = {'order': 'NSO', 'family': 'HNSO', 'name': 'Crew Head NSO', 'active': 'true'}
+known_roles2['OWB'] = {'order': 'NSO', 'family': 'PT', 'name': 'Outside Whiteboard'}
 # TODO handle NSO families somehow - might be better places in query rather than storage
 # nso_family = dict()
 # nso_family['ch'] = ['CHNSO']
 # nso_family['pt'] = ['PT', 'PW', 'IWB', 'OWB']
 # nso_family['st'] = ['JT', 'SO', 'SK']
 # nso_family['pm'] = ['PBM', 'PBT', 'LT']
+# Endorsement section
+endorsements = dict()
+endorsements['HR'] = 'HR'
+endorsements['Head Ref'] = 'HR'
+endorsements['IPR'] = 'IPR'
+endorsements['Inside Pack'] = 'IPR'
+endorsements['JR'] = 'JR'
+endorsements['Jam'] = 'JR'
+endorsements['OPR'] = 'OPR'
+endorsements['Outside Pack'] = 'OPR'
+endorsements['HNSO'] = 'Head NSO'
+endorsements['Head NSO'] = 'Head NSO'
+endorsements['ST'] = 'Score & Timing'
+endorsements['Scor'] = 'Score & Timing'
+endorsements['PM'] = 'Penalty Management'
+endorsements['Penalty Management'] = 'Penalty Management'
+endorsements['PT'] = 'Penalty Tracking'
+endorsements['Tracking'] = 'Penalty Tracking'
+endorsements['MRDA'] = 'MRDA Recognized'
 
+####################
 # configure stale_time to determine if the history doc needs to be reloaded
 SECONDS = 1
 MINUTES = 60*SECONDS
 HOURS = 60*MINUTES
 DAYS = 24*HOURS
-too_soon_to_retry_failures = time.time() - 2*HOURS
+# too_soon_to_retry_failures = time.time() - 2*HOURS
 too_soon_to_retry_failures = time.time() # short (debug) time
 stale_time = time.time() - 10*DAYS
-stale_time = time.time() - 2*DAYS # short (debug) time
+# stale_time = time.time() - 2*DAYS # short (debug) time
+
+# max run time before timing out:
+max_run_time = 15*MINUTES
+####################
+
+
+####################
+# Initialize datastores
+# couch_server = 'http://hero:oreh@themcclure.synology.me:59841' # docker image on the great machine
+# couch_server = 'http://hero:oreh@heroic.databutler.ca:59841' # docker image on the great machine with a hopefully more reliable DYNDNS
+couch_server = 'https://hero:oreh@couchdb-f40e3a.smileupps.com/' # hosted
+local_couch_server = 'http://admin:nimda@127.0.0.1:5984' # replicated local image'
+couch = couchdb.Server(couch_server)
+# couch = couchdb.Server(local_couch_server)
+offdb = couch['hero']
+faileddb = couch['heroic_failures']
+# TODO: add in officials-aliases db to track alternative names for finding them later
+# TODO: add in metadata db to provide lookups
+####################
+
+
+####################
+# Initialize authentication with Google
+def init_google_connection():
+    """
+    Authenticate end user from file first, if the credentials are valid
+    NOTE: Flows don't seem to return a refresh token, so when the access
+    token expires, you have to invoke user interaction
+    :return: authorized connection object
+    """
+    # shared secrets
+    CLIENT_ID = '48539282111-07fidfl1225gaiqk49ubb6r1fr21npln.apps.googleusercontent.com'
+    CLIENT_SECRET = 'CQ6-3PPwUjB6nZeYujAuqcWo'
+
+    # Set scope of permissions to accessing spreadsheets
+    scope = ['https://spreadsheets.google.com/feeds', 'https://docs.google.com/feeds',
+             # 'https://sheets.googleapis.com',
+             # 'https://drive.googleapis.com',
+             # 'https://www.googleapis.com/auth/spreadsheets',
+             # 'https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive',
+             ]
+    redirect_uri = 'http://localhost:8080'
+
+    # Initialize the "flow" of the Google OAuth2.0 end user credentials
+    flow = OAuth2WebServerFlow(client_id=CLIENT_ID,
+                               client_secret=CLIENT_SECRET,
+                               scope=scope,
+                               redirect_uri=redirect_uri)
+
+    # store the credential, so you don't keep bugging the user
+    storage = Storage('creds.data')
+
+    credentials = storage.get()
+    # refresh credentials if they're not valid
+    if not credentials or credentials.invalid or credentials.access_token_expired:
+        credentials = run_flow(flow, storage)
+
+    # if the token is valid but will expire before the max_run_time allowed, then refresh them
+    token_expires = (credentials.token_expiry - datetime.datetime.now()).seconds
+    print u"Token valid - expires in {} seconds.".format(token_expires)
+    if token_expires < max_run_time*2:
+        credentials = run_flow(flow, storage)
+
+    # Return an authenticated connection to the Google Sheets API
+    return gspread.authorize(credentials)
 ####################
 
 
@@ -131,7 +201,26 @@ def unshorten_url(url):
     :param url: the URL (short or otherwise)
     :return: the destination URL, or None if it's an invalid URL
     """
-    # STEP1 - quick and safe, high level processing of the URL
+    # STEP1 - strip out officiating history docs that are housed by a google apps domain - thanks Belfast Roller Derby and Jean-Quad Grand Slam
+    pattern = u'(https://docs.google.com/a/)(.+/)(spreadsheets/d/.+$)'
+    parts = re.match(pattern,url)
+    if parts:
+        parts = parts.groups()
+        url = parts[0] + parts[2]
+
+    # STEP2 - if this is a HTML view (because they're fuckers who hate life), then try to get the spreadsheet view
+    # search for any html flag (so far htmlpub and htmlview) and return the meat of the url with the edit ending instead
+    parts = re.search('(.+)/\w*html\w*$', url)
+    if parts:
+        # get rid of the html part of the url and try to force the edit view
+        url = parts.groups()[0] + '/edit'
+        # get rid of the weird folders in the URL in between the /spreadsheets/ and the /d/
+        parts = re.search('(.+spreadsheets).+(/d.+)', url)
+        if parts:
+            parts = parts.groups()
+            url = parts[0] + parts[1]
+
+    # STEP3 - quick and safe, high level processing of the URL
     try:
         new_url = requests.head(url, headers=http_header, allow_redirects=True).url
     except requests.ConnectionError as e:
@@ -139,7 +228,7 @@ def unshorten_url(url):
     if url_header in new_url:
         return new_url
 
-    # STEP2 - if the first pass doesn't give us a spreadsheet, try this lower level approach:
+    # STEP4 - if the first pass doesn't give us a spreadsheet, try this lower level approach:
     parsed = urlparse.urlparse(new_url)
     h = httplib.HTTPConnection(parsed.netloc)
     h.request('HEAD', parsed.path)
@@ -162,17 +251,6 @@ def unshorten_url(url):
         return requests.get(url, headers=http_header).url
         # return url
 
-####################
-
-
-####################
-# Initialize datastores
-couch = couchdb.Server('http://hero:hero@themcclure.synology.me:59841') # docker image on the great machine
-# couch = couchdb.Server('http://hero:hero@127.0.0.1:5984') # replicated local image
-offdb = couch['hero']
-faileddb = couch['heroic_failures']
-# TODO: add in officials-aliases db to track alternative names for finding them later
-# TODO: add in metadata db to provide lookups
 ####################
 
 
@@ -215,17 +293,20 @@ def get_name(sheet):
         - real name
         - document title
     :param sheet: the connected Google Sheet
-    :return: string with best guess at name
+    :return: a list of strings with best guess at name, followed by the raw value of each
     """
     summary = sheet.worksheet("Summary")
-    name = get_value(summary.acell('C4').value)
+    dname = get_value(summary.acell('C4').value)
+    rname = get_value(summary.acell('C3').value)
+    title = sheet.title
     # if the name is blank, fall back to real name
-    if name is None:
-        name = get_value(summary.acell('C3').value)
+    name = dname
+    if dname is None:
+        name = rname
     # if the name is blank, fall back to doc title
     if name is None:
-        name = sheet.title
-    return name
+        name = title
+    return [name, dname, rname, title]
 
 
 def normalize_cert_endorsements(refcert_string, nsocert_string):
@@ -234,20 +315,36 @@ def normalize_cert_endorsements(refcert_string, nsocert_string):
     were not recognized
     :param refcert_string: the raw ref string from the endorsement cells
     :param nsocert_string: the raw NSO string from the endorsement cells
-    :return: list of recognized endorsements, plus a split of the remaining entries
+    :return: sorted list of recognized endorsements, plus a split of the remaining entries
     """
     # If there's nothing in the string, return None
-    cert_string = ""
+    # cert_string = ""
+    # if refcert_string:
+    #     cert_string += refcert_string
+    # if nsocert_string:
+    #     cert_string += nsocert_string
+    # if not cert_string:
+    #     return None
+    #
+    # # at the moment, just return a list of the raw strings
+    # return map(lambda x: get_value(x), cert_string.split())
+    endorsement_list = list()
+    cert_string = ''
     if refcert_string:
-        cert_string += refcert_string
+        cert_string += refcert_string + ' '
     if nsocert_string:
         cert_string += nsocert_string
-    if not cert_string:
-        return None
-    # TODO catalog the list of the past endorsement options, possibly having to resort to regex
+    for key in endorsements:
+        if key in cert_string:
+            endorsement_list.append(endorsements[key])
 
-    # at the moment, just return a list of the raw strings
-    return map(lambda x: get_value(x), cert_string.split())
+    # dedupe the list
+    endorsement_list = sorted(list(set(endorsement_list)))
+
+    if len(endorsement_list) > 0:
+        endorsement_list.append('RAW: ' + cert_string)
+
+    return endorsement_list
 
 
 def normalize_cert_value(cert_string):
@@ -291,7 +388,9 @@ def normalize_cert_value(cert_string):
 
 def get_value(value, datatype=None, enum=None):
     """
-    Takes a string, and returns the value, or None if the content is equivaluent to the "empty string"
+    Takes a string, and returns the value, or None if the content is equivaluent to the "empty string".
+    If there is an enum list supplied, it will also only return elements found in that list.
+    If a datatype is supplied, there will also be an attempt to see if the input can be matched to that datatype
     :param value: raw spreadsheet value
     :param datatype: if the datatype is listed, the datatype is enforced on return value
     :param enum: a list containing valid values
@@ -311,11 +410,25 @@ def get_value(value, datatype=None, enum=None):
             return None
 
     # if the datatype is specified, return an entry in the that format, or else None
-    if datatype:
-        if isinstance(value, datatype):
-            return value
-        else:
+    if datatype == 'date':
+        # this will return a datetime object, if it's a valid ISO date format:
+        try:
+            if datetime.datetime.strptime(value,'%Y-%m-%d'):
+                return value
+        except:
+            pass
+        # this will return a datetime object, if it's incorrectly in the US date format:
+        try:
+            if datetime.datetime.strptime(value, '%m-%d-%Y'):
+                return value
+        except:
             return None
+        # if isinstance(value, datatype):
+        #     return value
+        # else:
+        #     return None
+    else:
+        return None
 
     # if datatype is not specified, return the entry
     return value
@@ -340,9 +453,14 @@ def process_games(history):
         game = dict()
         game['tab'] = source
 
-        val = get_value(row[0])
+        val = get_value(row[0],datatype='date')
         if val:
-            game['date'] = val
+            game['date'] = val[0] # raw date
+            game['dateparts'] = (val[1], val[2], val[3]) # processed date (YYYY, MM, DD)
+        else:
+            # if there's no recognizeable date (such as adding extra header rows, or completely fucking up the data format
+            # then skip the row, we don't know when the event was
+            continue
 
         val = get_value(row[1])
         if val:
@@ -421,6 +539,7 @@ def record_failure(url, reason, permanent_failure=None):
         record['permanent_failure'] = ""
 
     record['last_attempt'] = time.time()
+    record['last_attempt_readable'] = time.ctime()
     if permanent_failure:
         record['permanent_failure'] = permanent_failure
     faileddb[url] = record
@@ -451,14 +570,31 @@ def load_from_sheets(gconn, offdb, url):
     try:
         sheet = gconn.open_by_url(url)
     except gspread.SpreadsheetNotFound as e:
-        # There is a weirdness (likely in the grspread implementation of the Sheets API) that means if there are too many
+        # There is a weirdness (likely in the gspread implementation of the Sheets API) that means if there are too many
         # Sheet IDs, a valid sheet might not be found... but if you open the sheet, then it's in the 500 most recently used
         # and will be found... so if loading fails once, open the doc and try again... it might just work 2nd time around!
-        new_url = requests.get(url, headers=http_header).url
+
+        # Use the Raw API call to open the sheet, which hopefully puts it in the user's list of recent sheets and thus will be found now
+        # this didn't work either...
+        # requests.get(url, params='includeGridData=false')
+
+        # this way didn't work:
+        # new_url = requests.get(url, headers=http_header).url
+
+        # sheer brute force option seems to work (just maybe not for me with multiple google IDs...)
+        # but if we open it in a browser it works... so we force the issue by making a system call
+        # TODO: find a way to close the tab afterwards...
+        webbrowser.open_new_tab(url)
+        time.sleep(12*SECONDS)
+
         try:
-            sheet = gconn.open_by_url(new_url)
+            sheet = gconn.open_by_url(url)
         except gspread.SpreadsheetNotFound as e:
             msg = "Can't find a spreadsheet there - might be v1 or not a Sheets URL: {}".format(url)
+            record_failure(original_url, msg)
+            return False, msg
+        except Exception as e:
+            msg = "Something went wrong trying to open the URL: {}".format(str(e))
             record_failure(original_url, msg)
             return False, msg
     except Exception as e:
@@ -503,8 +639,8 @@ def load_from_sheets(gconn, offdb, url):
 
     # basic info
     summary = sheet.worksheet("Summary")
-    name = get_name(sheet)
-    print u"Loading: " + name
+    name_list = get_name(sheet)
+    print u"Loading: " + name_list[0]
     off = dict()
     off['_id'] = id
     # if the entry is in the db already, add in the revision number for db referential integrity
@@ -512,7 +648,10 @@ def load_from_sheets(gconn, offdb, url):
     if id in offdb:
         off['_rev'] = offdb[id]['_rev']
     off['url'] = url
-    off['name'] = unicode(name)
+    off['url_original'] = original_url
+    off['name'] = unicode(name_list[0])
+    if name_list[2]:
+        off['govt_name'] = unicode(name_list[2])
     off['template_version'] = 2
     off['last_updated'] = time.time()
     off['last_updated_readable'] = time.ctime()
@@ -569,27 +708,49 @@ def load_from_sheets(gconn, offdb, url):
 ####################
 def process_list(urls):
     """
-    Iterate through the list of URLs provided
+    Iterate through the list of URLs provided and load them into the database.
+    If they had previously failed to load, and there is an entry in the failure database, remove it if it was successfully loaded
     :param urls: list of URLs
     """
-    start_run_time = time.time()
-    # Open authenticated connection to the Google Sheets API
-    gconn = gspread.authorize(credentials)
+    start_time = time.time()
+
+    # get a connection to the Google sheets API
+    gconn = init_google_connection()
 
     # for each history doc, try to load it in the database
     print u"Attempting to load {} URLs".format(len(urls))
     failures = 0
+    successes = 0
     for url in urls:
         # print u"attempting {}".format(url)
         loaded_correctly, off = load_from_sheets(gconn, offdb, url)
         if loaded_correctly:
             print u"Processed {}".format(off['name'])
             offdb.save(off)
-        # this is an elif rather than an else, to suppress blank messages (for the "fresh" entries)
-        elif off and 'still current' not in off:
+            successes += 1
+            # if there's an entry in the failure database, clean it up
+            # TODO: in the future just mark it as successful, and exclude that from the views - so that once things are running smoothly we can track the intermittent errors
+            if url in faileddb:
+                print u"Removing {} from the failure database".format(url)
+                del faileddb[url]
+        # this branch returns as failed to load but it's really a success because the entry was skipped for being "fresh"
+        elif off and 'still current' in off:
+            successes += 1
+        # this branch is for all other fail responses
+        else:
             print u"URL {} was not loaded because: {}".format(url, off)
             failures += 1
-    print u"Total time {:.2f}s (with an init time of {:.2f}s). Of {} records, {} were not processed ({:.1f}%)".format((time.time() - start_init_time), (start_run_time - start_init_time), len(urls), failures, (failures * 100.0 / len(urls)))
+
+        # if this runs for a long time, it's more likely to cause timeout / session errors, so if it runs too long, stop
+        if (time.time() - start_time) > max_run_time:
+            print u"Processing took too long, stopping..."
+            break
+    records_processed = successes + failures
+    if records_processed > 0:
+        fail_rate = failures * 100.0 / records_processed
+    else:
+        fail_rate = 1
+    print u"Total time {:.2f}s. Of {} records, {} were processed (failure rate was {:.1f}%)".format((time.time() - start_time), len(urls), records_processed, fail_rate)
 
 
 def get_urls_from_sheet(sheet, tabname, column, num_header_rows=1):
@@ -601,11 +762,13 @@ def get_urls_from_sheet(sheet, tabname, column, num_header_rows=1):
     :param num_header_rows: the number of header rows to skip
     :return: a list of URLs
     """
-    start_run_time = time.time()
+    start_time = time.time()
     # Open authenticated connection to the Google Sheets API
-    gconn = gspread.authorize(credentials)
+    gconn = init_google_connection()
+
     # open a new Google Sheet
-    sheet = unshorten_url(sheet)
+    original_sheet = sheet
+    sheet = unshorten_url(original_sheet)
     try:
         sheet = gconn.open_by_url(sheet)
     except gspread.SpreadsheetNotFound:
@@ -621,29 +784,48 @@ def get_urls_from_sheet(sheet, tabname, column, num_header_rows=1):
             url_list.append(row[column])
     else:
         print u"Tab {} not found!".format(tabname)
-    print u"Time to load list of URLs {:.2f}s".format((time.time() - start_run_time))
+    print u"Time to load list of URLs {:.2f}s".format((time.time() - start_time))
     return url_list
 
 
-def get_stale_urls():
+def get_stale_urls(forced_only=False):
     """
     Query the database for entries that are deemed "stale" and return their URLs for reloading
+    :param forced_only: if this is set to true, then only returned force_refresh URLs
     :return: list of URLs
     """
     urls = list()
-    docquery = offdb.view('force_refresh/last_updated')
-    for row in docquery[:stale_time]:
-        urls.append(row['value'][2])
+    if not forced_only:
+        # return the entries that are stale (not updated since stale_time)
+        docquery = offdb.view('info/last_updated')
+        for row in docquery[:stale_time]:
+            urls.append(row['value'][2])
+    # load the entries marked as wanting to force a refresh
+    docquery = offdb.view('info/force_refresh')
+    for row in docquery:
+        urls.append(row['value'])
     return urls
 
 
-def get_failed_urls():
+def get_failed_urls(level=0):
     """
-    Query the failure database for entries that have failed in the past and return their URLs for reloading.
-    Except for the ones that are flagged as permanent failures.
+    Query the failure database for entries that have failed in the past and return those URLs for reloading.
+    Level of links to return:
+        0 = Just the links flagged as likely to be recoverable
+        1 = The links that are known to be easily recoverable (transient failures like token ran out part way through processing)
+        2 = All links, except for the ones that are flagged as permanent failures
+        3 = All links in the database
+    :param level: what level of links to return (default 0)
     :return: list of URLs
     """
-    return list(set(map(lambda x: x.get('id'), faileddb.view('info/all_but_bad_links'))))
+    viewname = 'info/likely_recoverable'
+    if level == 1:
+        viewname = 'info/easily_recoverable'
+    elif level == 2:
+        viewname = 'info/all_but_bad_links'
+    elif level == 3:
+        viewname = 'info/last_attempt'
+    return list(set(map(lambda x: x.get('id'), faileddb.view(viewname))))
 
 
 # if run from the command line, go through the test list of URLs
@@ -653,17 +835,24 @@ if __name__ == '__main__':
     # 'failed': get a list of the failed URLs to try again
     # tournament short name: named application form
     # anything else: test url list
-    source = 'playoffs2016'
+    # source = 'playoffs2016'
     # source = 'cc'
+    # source = 'failures'
+    # source = 'stale'
+    source = 'forced'
     # source = 'other'
     if source == 'stale':
         # entries in the database that are stale and should be refreshed
         urls = get_stale_urls()
-        print u'stale urls: {}'.format(len(get_stale_urls()))
-    elif source == 'failed':
+        print u'stale urls: {}'.format(len(urls))
+    elif source == 'forced':
+        # entries in the database that are stale and should be refreshed
+        urls = get_stale_urls(forced_only=True)
+        print u'stale urls: {}'.format(len(urls))
+    elif source == 'failures':
         # URLs that have been unsuccessfully loaded and should be retried
         urls = get_failed_urls()
-        print u'failed urls: {}'.format(len(get_stale_urls()))
+        print u'failed urls: {}'.format(len(urls))
     elif source == 'cc':
         # clover cup
         sheet_url = 'https://docs.google.com/spreadsheets/d/1qTFa3wzi-3HJ_5JGtr12cZiQ6K9U9pWL9UI8TDo0fUU/edit#gid=1023242182'
@@ -685,20 +874,34 @@ if __name__ == '__main__':
             # 'http://tiny.cc/Jules-and-Regulations',
             # 'http://www.tinyurl.com/IoneDat455',
             # 'https://docs.google.com/spreadsheets/d/1GhuD7i1B_MVI6AjSUsNXiEUsUFuGzQxAMH0hmH6j27c/edit#gid=1988016352',
-            'https://docs.google.com/a/belfastrollerderby.co.uk/spreadsheets/d/1Qvg20aEYs9iV2S-te1Tt_FK9McnTVKWRmqRr0yrw9Qo/edit?usp=docslist_api',
+            'http://bit.do/4DKx',
         ]
 
     # remove the duplicate entries
     url_set = set(urls)
-    # remove the known bad entries
-    urls = list(url_set - set(map(lambda x: x.get('id'), faileddb.view('info/known_bad_links'))))
+    # remove the known bad entries, if this isn't sourced from the failure database:
+    if source != 'failures':
+        urls = list(url_set - set(map(lambda x: x.get('id'), faileddb.view('info/known_bad_links'))))
 
     # do the heavy lifting
     process_list(urls)
 
     # test fragment to demonstrate a view query for how many stale URLs there are in the DB:
-    docquery = offdb.view('force_refresh/last_updated')
-    two_hours_stale = docquery[:(time.time() - 2*HOURS)].rows
+    docquery = offdb.view('info/last_updated')
     two_days_stale = docquery[:(time.time() - 2*DAYS)].rows
-    print u"total number = {}\n2 hours (test) stale {}\n2 days (fully) stale {}".format(docquery.total_rows,
-                            len(two_hours_stale), len(two_days_stale))
+    ten_days_stale = docquery[:(time.time() - 10*DAYS)].rows
+    print u"total number = {}\n2 days (test) stale {}\n10 days (fully) stale {}".format(docquery.total_rows,
+                            len(two_days_stale), len(ten_days_stale))
+
+    # for good measure, automatically replicate to the local couchdb, if it exists
+    replication_flag = False
+    replication_flag = True
+    if replication_flag:
+        local_couch = couchdb.Server(local_couch_server)
+        replicator = local_couch['_replicator']
+
+        refresh_views = ['replicate_hero_with_great_machine', 'replicate_failures_with_great_machine']
+        for view in refresh_views:
+            record = replicator[view]
+            record['_replication_state'] = ''
+            replicator[view] = record
