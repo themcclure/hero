@@ -1,2 +1,2 @@
 # hero
-History &amp; Experience Repository of Officials
+History & Experience Repository of Officials

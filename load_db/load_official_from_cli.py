@@ -1,6 +1,7 @@
 from oauth2client.client import OAuth2WebServerFlow
 from oauth2client.tools import run_flow
 from oauth2client.file import Storage
+import hero.util
 import validators
 import couchdb
 import gspread
@@ -10,6 +11,7 @@ import requests
 import re
 import httplib
 import urlparse
+import sys
 # ugly workarounds
 import webbrowser
 
@@ -22,6 +24,7 @@ url_header = 'https://docs.google.com/spreadsheets/d/'
 http_header = {'user-agent': 'hero/1.0'}
 
 # utility definitions
+# TODO: move this to a metadata DB
 # what do people write that means empty/no-value
 blank_entries = [
     None,
@@ -119,9 +122,9 @@ SECONDS = 1
 MINUTES = 60*SECONDS
 HOURS = 60*MINUTES
 DAYS = 24*HOURS
-# too_soon_to_retry_failures = time.time() - 2*HOURS
-too_soon_to_retry_failures = time.time() # short (debug) time
-stale_time = time.time() - 10*DAYS
+too_soon_to_retry_failures = time.time() - 2*HOURS
+# too_soon_to_retry_failures = time.time() # short (debug) time
+stale_time = time.time() - 30*DAYS
 # stale_time = time.time() - 2*DAYS # short (debug) time
 
 # max run time before timing out:
@@ -132,9 +135,10 @@ max_run_time = 15*MINUTES
 ####################
 # Initialize datastores
 # couch_server = 'http://hero:oreh@themcclure.synology.me:59841' # docker image on the great machine
-# couch_server = 'http://hero:oreh@heroic.databutler.ca:59841' # docker image on the great machine with a hopefully more reliable DYNDNS
-couch_server = 'https://hero:oreh@couchdb-f40e3a.smileupps.com/' # hosted
+couch_server = 'http://hero:oreh@heroic.databutler.ca:59841' # docker image on the great machine with a hopefully more reliable DYNDNS
+# couch_server = 'https://hero:oreh@couchdb-f40e3a.smileupps.com/' # hosted
 local_couch_server = 'http://admin:nimda@127.0.0.1:5984' # replicated local image'
+couch_server = local_couch_server
 couch = couchdb.Server(couch_server)
 # couch = couchdb.Server(local_couch_server)
 offdb = couch['hero']
@@ -201,12 +205,18 @@ def unshorten_url(url):
     :param url: the URL (short or otherwise)
     :return: the destination URL, or None if it's an invalid URL
     """
+
+    # TODO: refactor as a "get document" function that unshortens and iterates through things to get to a doc in the end
+    # STEP 0 - if the URL is already a google sheets format, then stop here
+    if url_header in url:
+        return url
+
     # STEP1 - strip out officiating history docs that are housed by a google apps domain - thanks Belfast Roller Derby and Jean-Quad Grand Slam
     pattern = u'(https://docs.google.com/a/)(.+/)(spreadsheets/d/.+$)'
     parts = re.match(pattern,url)
     if parts:
         parts = parts.groups()
-        url = parts[0] + parts[2]
+        url = u'https://docs.google.com/' + parts[2]
 
     # STEP2 - if this is a HTML view (because they're fuckers who hate life), then try to get the spreadsheet view
     # search for any html flag (so far htmlpub and htmlview) and return the meat of the url with the edit ending instead
@@ -298,7 +308,7 @@ def get_name(sheet):
     summary = sheet.worksheet("Summary")
     dname = get_value(summary.acell('C4').value)
     rname = get_value(summary.acell('C3').value)
-    title = sheet.title
+    title = get_value(sheet.title)
     # if the name is blank, fall back to real name
     name = dname
     if dname is None:
@@ -340,9 +350,6 @@ def normalize_cert_endorsements(refcert_string, nsocert_string):
 
     # dedupe the list
     endorsement_list = sorted(list(set(endorsement_list)))
-
-    if len(endorsement_list) > 0:
-        endorsement_list.append('RAW: ' + cert_string)
 
     return endorsement_list
 
@@ -411,6 +418,9 @@ def get_value(value, datatype=None, enum=None):
 
     # if the datatype is specified, return an entry in the that format, or else None
     if datatype == 'date':
+        # normalize the date separators:
+        value = re.sub('[/.:]', '-', value)
+
         # this will return a datetime object, if it's a valid ISO date format:
         try:
             if datetime.datetime.strptime(value,'%Y-%m-%d'):
@@ -423,12 +433,6 @@ def get_value(value, datatype=None, enum=None):
                 return value
         except:
             return None
-        # if isinstance(value, datatype):
-        #     return value
-        # else:
-        #     return None
-    else:
-        return None
 
     # if datatype is not specified, return the entry
     return value
@@ -438,7 +442,7 @@ def process_games(history):
     """
     Go through the history tab, and process each game entry and store it
     :param history: the history tab of the Google Sheet
-    :return: a dict of game data
+    :return: a list of dicts of game data
     """
     # Record which tab the record came from
     source = history.title
@@ -455,8 +459,9 @@ def process_games(history):
 
         val = get_value(row[0],datatype='date')
         if val:
-            game['date'] = val[0] # raw date
-            game['dateparts'] = (val[1], val[2], val[3]) # processed date (YYYY, MM, DD)
+            game['date'] = hero.util.seconds_since_epoch(hero.util.get_date_value(val))
+            game['date_readable'] = val # raw date
+            game['dateparts'] = val.split('-') # processed date (YYYY, MM, DD)
         else:
             # if there's no recognizeable date (such as adding extra header rows, or completely fucking up the data format
             # then skip the row, we don't know when the event was
@@ -465,6 +470,8 @@ def process_games(history):
         val = get_value(row[1])
         if val:
             game['event'] = val
+            # record the raw event data, for comparison to the nornalized data
+            game['event_raw'] = val
 
         val = get_value(row[2])
         if val:
@@ -557,11 +564,12 @@ def load_from_sheets(gconn, offdb, url):
     """
     # open a new Google Sheet
     original_url = url
-    url = unshorten_url(url)
-
     # if the url has been tried before but it was flagged as failing to load for an unidentified problem recently, skip them
     if (url in faileddb) and (faileddb[url]['last_attempt'] > too_soon_to_retry_failures):
         return False, "URL was attempted but failed too recently, skipping: {}".format(url)
+
+    # if the raw URL is not in the failure database, then unshorten it
+    url = unshorten_url(url)
 
     if not validators.url(url):
         msg = "No valid URL found at {}".format(url)
@@ -597,6 +605,7 @@ def load_from_sheets(gconn, offdb, url):
             msg = "Something went wrong trying to open the URL: {}".format(str(e))
             record_failure(original_url, msg)
             return False, msg
+        # TODO: COPY the file to a temporary location and try again!
     except Exception as e:
         msg = "Something went wrong trying to open the URL: {}".format(str(e))
         record_failure(original_url, msg)
@@ -621,21 +630,22 @@ def load_from_sheets(gconn, offdb, url):
     # officials unique ID is the history doc ID
     id = sheet.id
 
-    # does the official exist in the offdb already?
-    if id in offdb:
-        # print u"Found existing entry for: " + offdb[id]['name']
-        # if they exist and the force_refresh flag both exists and is set then force a refresh
-        if ('force_refresh' in offdb[id]) and (offdb[id]['force_refresh']):
-            print u"Forcing refresh of {}, per db flag".format(offdb[id]['name'])
-        # if they exist and they were updated more recently than the stale_time limit, then skip them
-        elif offdb[id]['last_updated'] > stale_time:
-            # print "They're delightfully fresh, moving on..."
-            return False, u"{} is still current in the database".format(offdb[id]['name'])
-            # return False, None
-        # in all other cases, the record needs to be updated
-        else:
-            # print "They're a bit on the nose, getting a new copy..."
-            pass
+    # TODO: Uncomment out this block - it's all commented out to force a refresh of the data since the schema changed
+    # # does the official exist in the offdb already?
+    # if id in offdb:
+    #     # print u"Found existing entry for: " + offdb[id]['name']
+    #     # if they exist and the force_refresh flag both exists and is set then force a refresh
+    #     if ('force_refresh' in offdb[id]) and (offdb[id]['force_refresh']):
+    #         print u"Forcing refresh of {}, per db flag".format(offdb[id]['name'])
+    #     # if they exist and they were updated more recently than the stale_time limit, then skip them
+    #     elif offdb[id]['last_updated'] > stale_time:
+    #         # print "They're delightfully fresh, moving on..."
+    #         return False, u"{} is still current in the database".format(offdb[id]['name'])
+    #         # return False, None
+    #     # in all other cases, the record needs to be updated
+    #     else:
+    #         # print "They're a bit on the nose, getting a new copy..."
+    #         pass
 
     # basic info
     summary = sheet.worksheet("Summary")
@@ -647,8 +657,13 @@ def load_from_sheets(gconn, offdb, url):
     # this will only cause a problem if two people are updating the same record concurrently
     if id in offdb:
         off['_rev'] = offdb[id]['_rev']
+    # the URL that was loaded
     off['url'] = url
-    off['url_original'] = original_url
+    # if there is an original URL in the db, keep it. If not, use this attempt's original URL
+    if 'url_original' in offdb[id]:
+        off['url_original'] = offdb[id]['url_original']
+    else:
+        off['url_original'] = original_url
     off['name'] = unicode(name_list[0])
     if name_list[2]:
         off['govt_name'] = unicode(name_list[2])
@@ -676,9 +691,16 @@ def load_from_sheets(gconn, offdb, url):
             off['cert']['ref_level'] = ref_level
         if nso_level:
             off['cert']['nso_level'] = nso_level
-        cert_endorsements = normalize_cert_endorsements(get_value(summary.acell('G7').value), get_value(summary.acell('G8').value))
+        refcert_val = get_value(summary.acell('G7').value)
+        nsocert_val = get_value(summary.acell('G8').value)
+        cert_endorsements = normalize_cert_endorsements(refcert_val, nsocert_val)
         if cert_endorsements:
             off['cert']['cert_endorsements'] = cert_endorsements
+            # list the raw endorsement entries, for comparison against the normalized value
+            if refcert_val:
+                off['cert']['cert_endorsements_raw'] = 'ref=' + refcert_val + ' '
+            if nsocert_val:
+                off['cert']['cert_endorsements_raw'] = 'nso=' + nsocert_val
 
     # insurance information
     number = get_value(summary.acell('C6').value)
@@ -690,8 +712,9 @@ def load_from_sheets(gconn, offdb, url):
 
     # game information from the main "Game History"
     games = process_games(sheet.worksheet("Game History"))
+    off['games'] = list()
     if games:
-        off['games'] = games
+        off['games'] += games
 
     # process the "Other History" tab
     if "Other History" in map(lambda x: x.title, sheet.worksheets()):
@@ -717,6 +740,9 @@ def process_list(urls):
     # get a connection to the Google sheets API
     gconn = init_google_connection()
 
+    # TODO: figure out how to handle max time more consistently - but for now make it 5 minutes less than the credentials last
+    max_run_time = (gconn.auth.token_expiry - datetime.datetime.now()).seconds - 5*MINUTES
+
     # for each history doc, try to load it in the database
     print u"Attempting to load {} URLs".format(len(urls))
     failures = 0
@@ -736,6 +762,11 @@ def process_list(urls):
         # this branch returns as failed to load but it's really a success because the entry was skipped for being "fresh"
         elif off and 'still current' in off:
             successes += 1
+            # if there's an entry in the failure database, clean it up
+            # TODO: in the future just mark it as successful, and exclude that from the views - so that once things are running smoothly we can track the intermittent errors
+            if url in faileddb:
+                print u"Removing {} from the failure database".format(url)
+                del faileddb[url]
         # this branch is for all other fail responses
         else:
             print u"URL {} was not loaded because: {}".format(url, off)
@@ -835,12 +866,25 @@ if __name__ == '__main__':
     # 'failed': get a list of the failed URLs to try again
     # tournament short name: named application form
     # anything else: test url list
-    # source = 'playoffs2016'
-    # source = 'cc'
-    # source = 'failures'
-    # source = 'stale'
-    source = 'forced'
-    # source = 'other'
+    # brute force way of handling args, because the google libraries shit themselves if there are unexpected args still...
+    source = 'test'
+    if len(sys.argv) > 1:
+        if 'stale' in sys.argv:
+            source = 'stale'
+        elif 'failures' in sys.argv:
+            source = 'failures'
+        elif 'forced' in sys.argv:
+            source = 'forced'
+        elif 'playoffs2016' in sys.argv:
+            source = 'playoffs2016'
+        elif 'cc' in sys.argv:
+            source = 'cc'
+        elif 'spud' in sys.argv:
+            source = 'spud'
+        if source != 'test':
+            index = sys.argv.index(source)
+            del sys.argv[index]
+
     if source == 'stale':
         # entries in the database that are stale and should be refreshed
         urls = get_stale_urls()
@@ -851,12 +895,16 @@ if __name__ == '__main__':
         print u'stale urls: {}'.format(len(urls))
     elif source == 'failures':
         # URLs that have been unsuccessfully loaded and should be retried
-        urls = get_failed_urls()
+        urls = get_failed_urls(2)
         print u'failed urls: {}'.format(len(urls))
     elif source == 'cc':
-        # clover cup
+        # clover cup 2017
         sheet_url = 'https://docs.google.com/spreadsheets/d/1qTFa3wzi-3HJ_5JGtr12cZiQ6K9U9pWL9UI8TDo0fUU/edit#gid=1023242182'
         urls = get_urls_from_sheet(sheet_url, 'Form Responses 1', 5)
+    elif source == 'spud':
+        # spudtown 2016
+        sheet_url = 'https://docs.google.com/spreadsheets/d/1PpRykoZoqyYLbiLQ4iUXbUhSTvQrkbCTJXBSukIVXEU/edit#gid=607697869'
+        urls = get_urls_from_sheet(sheet_url, 'Form Responses 1', 7)
     elif source == 'playoffs2016':
         # playoffs 2016
         sheet_url = 'https://docs.google.com/spreadsheets/d/1hXwxFjFFFiGsDXpnSj2WW6Fls1pqJ9XOFMGOZDy_9FE/edit#gid=848540806'
@@ -870,11 +918,10 @@ if __name__ == '__main__':
         urls += get_urls_from_sheet(sheet_url, 'NSO Applicants', 10)
     else:
         urls = [
-            # 'https://docs.google.com/spreadsheets/d/1u5vzy1ddsEZS5y5grIwfSGef4_5cARX6VVeIoUo-Zag/edit#gid=1988016352',
-            # 'http://tiny.cc/Jules-and-Regulations',
-            # 'http://www.tinyurl.com/IoneDat455',
-            # 'https://docs.google.com/spreadsheets/d/1GhuD7i1B_MVI6AjSUsNXiEUsUFuGzQxAMH0hmH6j27c/edit#gid=1988016352',
-            'http://bit.do/4DKx',
+            'https://kweerious.com/bouts',
+            'https://docs.google.com/spreadsheets/d/1d5vHV4s8JsnO_G1ekadNlnajwZATPpHaoheNfrr_8Zc/edit#gid=1988016352',
+            'https://docs.google.com/spreadsheets/d/1ONkn7kH8ogWp461DzU5HDX7kP-u9vBWcnTPlzdKWL3U/edit#gid=1237957861',
+            # 'https://docs.google.com/a/belfastrollerderby.co.uk/spreadsheets/d/1Qvg20aEYs9iV2S-te1Tt_FK9McnTVKWRmqRr0yrw9Qo/edit?usp=docslist_api',
         ]
 
     # remove the duplicate entries
