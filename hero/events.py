@@ -45,7 +45,9 @@ def add_event(short_name, name, year, assn, event_type, application_close_date, 
             form_url, 
             tab_name, 
             applicant_name_column,
-            applicant_url_column
+            applicant_url_column,
+            application_date,
+            positions_applied_for <- all numbers from here on are assumed to be positions applied for columns 
             )
     :return: None
     """
@@ -136,6 +138,9 @@ def scan_event_application(event):
                 official['application_date_readable'] = app_date.strftime('%Y-%m-%d')
                 official['positions_raw'] = ', '.join(off[3:])
                 official['positions'] = normalize_positions(off[3:])
+                # if the official hasn't applied for any positions, then skip them
+                if len(official['positions']) == 0:
+                    continue
                 if event_dict['freeze_date_is_close_date']:
                     official['freeze_date'] = seconds_since_epoch(close_date)
                     official['freeze_date_readable'] = close_date.strftime('%Y-%m-%d')
@@ -253,6 +258,9 @@ if __name__ == '__main__':
         # ])
 
         # already loaded:
+        # hero.events.add_event('playoffs2017-d2-pittsburgh', 'WFTDA Playoffs', 2017, 'WFTDA', 'Playoff', '2017-05-08', [
+        #     ('https://docs.google.com/spreadsheets/d/179258kBaBI8CPeR2YOZ11wSMrZa1auwE9rhQLQPh9Hs/edit#gid=1898054907', 'Officiating Applicants', 1, 10, 0, 22),
+        # ])
         # hero.events.add_event('playoffs2015-d2-cleveland', 'WFTDA Playoffs', 2016, 'WFTDA', 'Playoff', '2015-05-31', [
         #     ('https://docs.google.com/spreadsheets/d/1Yjy0fyO5JRGfb-jDiZZtZrSu1Zx0BRD-6MtI8aMgsOc/edit#gid=1900228492', 'Referee Applications ', 2, 14, 0, 21),
         #     ('https://docs.google.com/spreadsheets/d/1Qon6HxF5h7xL5VtlokQlcAVu4rIkSMtw2y9ocKD1FaE/edit#gid=818570689', 'NSO Applications ', 2, 15, 1, 22),
@@ -301,9 +309,10 @@ if __name__ == '__main__':
         # scan_event_application('rollercon2016')  # needs @themcclure
         # scan_event_application('st2015')  # broken?
         # scan_event_application('st2016')  # needs @themcclure
+        scan_event_application('playoffs2017-d2-pittsburgh')
         # qualify_applicants('cc2017')
         # qualify_applicants('cc2016')
-        qualify_applicants('st2016')
+        # qualify_applicants('st2016')
         # for t in eventdb:
         #     scan_event_application(t)
     except Exception as e:

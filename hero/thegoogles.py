@@ -11,6 +11,7 @@ import re
 import requests
 import time
 import datetime
+import urllib2
 import hero.config
 import hero.util
 
@@ -103,7 +104,10 @@ def get_columns_from_sheet(sheet_url, tabname, num_header_rows, min_columns, col
     start_time = time.time()
 
     # Open the sheet
-    sheet = open_by_url(sheet_url)
+    [sheet, final_url] = open_by_url(sheet_url)
+    if final_url != sheet_url:
+        print u"Looks like a short URL was used for this: {}".format(sheet_url)
+
     data_list = list()
     tablist = map(lambda x: x.title, sheet.worksheets())
     if tabname in tablist:
@@ -176,7 +180,8 @@ def unshorten_url(original_url):
     url = original_url
 
     # Step 0: if there is no protocol information (http(s)://) then add it:
-    if http_protocol not in url or https_protocol not in url:
+    # TODO: look into urlparse for this
+    if http_protocol not in url and https_protocol not in url:
         url = https_protocol + url
 
     # Step 1: if the URL is a google docs URL, return it (this is kind of the chorus)
@@ -212,6 +217,15 @@ def unshorten_url(original_url):
         return url
 
     # Step 4: quick and safe, high level processing of the URL to see try to follow any redirects in the header response
+    try:
+        url = urllib2.urlopen(url)
+    except Exception:
+        pass
+
+    if sheets_url_core in url:
+        return url
+
+    # Step 5: safe, high level processing of the URL to see try to follow any redirects in the header response
     try:
         url = requests.head(url, headers=http_header, allow_redirects=True).url
     except requests.ConnectionError as e:
