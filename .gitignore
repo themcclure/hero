@@ -83,7 +83,6 @@ celerybeat-schedule
 .venv
 venv/
 ENV/
-env/
 
 # Spyder project settings
 .spyderproject
@@ -95,4 +94,5 @@ env/
 .idea
 
 # Credential data
-/load_db/creds.data
+.DS_Store
+creds.data
